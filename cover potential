@@ -1,0 +1,215 @@
+import pandas as pd
+import numpy as np
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import KFold, cross_val_score
+from sklearn.metrics import r2_score
+import geopandas as gpd
+import joblib
+from scipy.stats import chi2
+import warnings
+from tqdm import tqdm  # Progress bar
+
+# Disable warnings
+warnings.filterwarnings('ignore')
+
+# Constants
+BASE_PATH = './'  # Set default path to current directory
+np.random.seed(48)  # Global random seed
+
+
+def load_data():
+    """Load datasets"""
+    print("Loading datasets...")
+    exist_data = pd.read_csv(f'{BASE_PATH}train_data.csv')
+    non_exist_data = gpd.read_file(f'{BASE_PATH}current.gdb', layer='no_exist_data')
+    predict_data = gpd.read_file(f'{BASE_PATH}current.gdb', layer='predict_data')
+
+    print(f'Exist data: {exist_data.shape}, Non-exist data: {non_exist_data.shape}')
+    print(f'Predict data: {predict_data.shape}, CRS: {predict_data.crs}')
+
+    # Coordinate reference system (CRS) check
+    if predict_data.crs.to_string() != 'EPSG:4326':
+        predict_data = predict_data.to_crs('EPSG:4326')
+
+    return exist_data, non_exist_data, predict_data
+
+
+params_df = pd.read_csv(f'{BASE_PATH}grid_search_results.csv')
+params_str = eval(params_df['Parameters'].iloc[0])
+variables_per_split, min_leaf_population, max_nodes, n_trees = params_str
+print(f'Evaluating parameters: {params_str}')
+
+
+def prepare_features(exist_data, predict_data):
+    """Feature engineering"""
+    feature_columns = exist_data.columns.drop('cover').tolist()
+
+    # Ensure feature consistency between training and prediction datasets
+    missing_features = set(feature_columns) - set(predict_data.columns)
+    if missing_features:
+        raise ValueError(f"Missing feature columns in predict data: {missing_features}")
+
+    # Ensure data type consistency
+    for col in feature_columns:
+        if predict_data[col].dtype != exist_data[col].dtype:
+            try:
+                predict_data[col] = predict_data[col].astype(exist_data[col].dtype)
+            except:
+                raise ValueError(f"Failed to convert feature column {col} to expected type ({exist_data[col].dtype})")
+
+    return feature_columns, predict_data[feature_columns]
+
+
+def mahalanobis_distance(X, mean, cov_inv):
+    """Calculate Mahalanobis distance"""
+    diff = X - mean
+    return np.sqrt(np.einsum('...i,...j,ij->...', diff, diff, cov_inv))
+
+
+def check_extrapolation(X_train, X_predict, chi2_threshold=0.95):
+    """Check for extrapolation using Mahalanobis distance"""
+    try:
+        mean = np.mean(X_train, axis=0)
+        cov = np.cov(X_train, rowvar=False)
+        cov_inv = np.linalg.pinv(cov)  # Use pseudo-inverse to avoid singular matrix issues
+    except Exception as e:
+        print(f"Covariance matrix calculation failed: {e}")
+        return np.zeros(len(X_predict), dtype=bool)
+
+    # Chi-square critical value threshold
+    df = X_train.shape[1]
+    threshold = chi2.ppf(chi2_threshold, df)
+
+    # Calculate Mahalanobis distance
+    distances = mahalanobis_distance(X_predict, mean, cov_inv)
+    return distances > threshold
+
+
+def train_model(X_train, y_train):
+    """Train RandomForest model"""
+    model = RandomForestRegressor(
+        n_estimators=n_trees, min_samples_leaf=min_leaf_population,
+        max_features=variables_per_split, max_leaf_nodes=max_nodes,
+        bootstrap=True, max_samples=0.632, random_state=48, n_jobs=-1, oob_score=True
+    )
+    model.fit(X_train, y_train)
+
+    # OOB R2 score
+    oob_pred = model.oob_prediction_
+    oob_r2 = r2_score(y_train, oob_pred)
+
+    # In-bag R2 scores
+    in_bag_idx = model.estimators_samples_
+    in_bag_r2 = []
+    for estimator, samples in zip(model.estimators_, in_bag_idx):
+        pred = estimator.predict(X_train.iloc[samples])
+        true = y_train.iloc[samples]
+        in_bag_r2.append(r2_score(true, pred))
+
+    return model, {
+        'oob_r2': oob_r2,
+        'in_bag_r2_mean': np.mean(in_bag_r2),
+        'in_bag_r2_std': np.std(in_bag_r2)
+    }
+
+
+def main_workflow():
+    # Load datasets
+    exist_data, non_exist_data, predict_data = load_data()
+
+    # Feature preparation
+    feature_columns, X_predict = prepare_features(exist_data, predict_data)
+
+    # Initialize storage for evaluation metrics
+    performance_metrics = {
+        'Iteration': [],
+        'OOB_R2': [],
+        'InBag_R2': [],
+        'CV_R2': [],
+        'Test_R2': []
+    }
+
+    results = {
+        'predictions': [],
+        'extrapolation_flags': []
+    }
+
+    # Model training iterations
+    for iteration in tqdm(range(10), desc="Model iteration"):
+        # Sample non-exist data to balance the dataset
+        non_exist_sample = non_exist_data.sample(
+            n=2 * len(exist_data),
+            replace=True,
+            random_state=iteration + 48
+        )[feature_columns]
+
+        # Combine datasets
+        X_train = pd.concat([exist_data[feature_columns], non_exist_sample])
+        y_train = pd.concat([
+            exist_data['cover'],
+            pd.Series(0, index=non_exist_sample.index)
+        ])
+        print(f'{iteration +1}: Data size: {X_train.shape[0]}')
+
+        # Train model
+        model, r2_metrics = train_model(X_train, y_train)
+
+        # Save the trained model
+        joblib.dump(model, f'{BASE_PATH}model_rf_{iteration+1}.joblib')
+
+        # K-fold cross-validation
+        cv = KFold(n_splits=10, shuffle=True, random_state=iteration)
+        cv_scores = cross_val_score(model, X_train, y_train, cv=cv, scoring='r2')
+
+        # Record evaluation metrics
+        performance_metrics['Iteration'].append(iteration + 1)
+        performance_metrics['OOB_R2'].append(r2_metrics['oob_r2'])
+        performance_metrics['InBag_R2'].append(r2_metrics['in_bag_r2_mean'])
+        performance_metrics['CV_R2'].append(np.mean(cv_scores))
+
+        # Predict and store results
+        preds = model.predict(X_predict)
+        results['predictions'].append(preds)
+
+        # Calculate test R2 score (on full training data)
+        test_pred = model.predict(X_train)
+        performance_metrics['Test_R2'].append(r2_score(y_train, test_pred))
+
+        # Store extrapolation flags
+        results['extrapolation_flags'].append(
+            check_extrapolation(X_train.values, X_predict.values)
+        )
+
+    # Aggregate results
+    final_pred = np.mean(results['predictions'], axis=0)
+    min_pred = np.min(results['predictions'], axis=0)
+    max_pred = np.max(results['predictions'], axis=0)
+
+    # Build output GeoDataFrame
+    output_gdf = predict_data.copy()
+    output_gdf['Pred_Mean'] = final_pred
+    output_gdf['Pred_Min'] = min_pred
+    output_gdf['Pred_Max'] = max_pred
+    output_gdf['Extrapolation_Type'] = np.where(
+        np.mean(results['extrapolation_flags'], axis=0) > 0.5, 2, 1
+    )
+    output_gdf['Model_Uncertainty'] = np.std(results['predictions'], axis=0)
+
+    # Save evaluation metrics to CSV
+    pd.DataFrame(performance_metrics).to_csv(
+        f'{BASE_PATH}model_performance_metrics.csv', index=False
+    )
+
+    # Save prediction results in batches
+    batch_size = 1_000_000
+    for i in range(0, len(output_gdf), batch_size):
+        batch = output_gdf.iloc[i:i + batch_size]
+        batch.to_file(
+            f'{BASE_PATH}RF_predictions_batch_{i // batch_size}.shp',
+            driver='ESRI Shapefile'
+        )
+
+
+if __name__ == "__main__":
+    main_workflow()
+    print("Processing complete! Results saved in the output directory.")
