@@ -9,8 +9,6 @@ from scipy.stats import chi2
 import warnings
 from tqdm import tqdm  # Progress bar
 
-# Disable warnings
-warnings.filterwarnings('ignore')
 
 # Constants
 BASE_PATH = './'  # Set default path to current directory
