@@ -96,8 +96,8 @@ def sample_and_train(non_exist_data, exist_data, X_predict):
         all_predictions.append(y_prob_predict)  # Store prediction probabilities
 
         # Calculate evaluation metrics using out-of-bag (OOB) samples
-        y_train_pred = rf_model.oob_decision_function_[:, 1] >= 0.5
-        auc_score = roc_auc_score(y_train_combined, y_train_pred)
+        y_prob_oob = rf_model.oob_decision_function_[:, 1]
+        auc_score = roc_auc_score(y_train_combined, y_prob_oob)
         kappa_score = cohen_kappa_score(y_train_combined, y_train_pred)
         cm = confusion_matrix(y_train_combined, y_train_pred)
         tss = (cm[1, 1] / (cm[1, 1] + cm[1, 0])) - (cm[0, 1] / (cm[0, 1] + cm[0, 0]))
