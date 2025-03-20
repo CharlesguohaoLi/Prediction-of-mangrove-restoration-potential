@@ -123,8 +123,7 @@ def main_workflow():
         'Iteration': [],
         'OOB_R2': [],
         'InBag_R2': [],
-        'CV_R2': [],
-        'Test_R2': []
+        'CV_R2': []
     }
 
     results = {
@@ -168,10 +167,6 @@ def main_workflow():
         # Predict and store results
         preds = model.predict(X_predict)
         results['predictions'].append(preds)
-
-        # Calculate test R2 score (on full training data)
-        test_pred = model.predict(X_train)
-        performance_metrics['Test_R2'].append(r2_score(y_train, test_pred))
 
         # Store extrapolation flags
         results['extrapolation_flags'].append(
